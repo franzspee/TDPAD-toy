@@ -56,6 +56,24 @@ class PosteriorResult:
     a2_grid: np.ndarray
 
 
+@dataclass
+class ChiSquaredPosteriorResult:
+    """Binned chi-squared posterior for one cumulative event snapshot."""
+
+    posterior: np.ndarray  # shape: n_g, n_a
+    chi2: np.ndarray
+    map_g: float
+    map_a2: float
+    g_grid: np.ndarray
+    a2_grid: np.ndarray
+    bin_centers: np.ndarray
+    asymmetry: np.ndarray
+    asymmetry_error: np.ndarray
+    det0_counts: np.ndarray
+    det1_counts: np.ndarray
+    valid_bins: np.ndarray
+
+
 
 def p2_from_delta(delta_rad: np.ndarray) -> np.ndarray:
     """Return P2(cos(delta)) = 0.25 + 0.75 cos(2 delta)."""
@@ -321,7 +339,8 @@ def binned_asymmetry(
     t_min_ns: float,
     t_max_ns: float,
     bins: int = 16,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    require_positive_counts: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute detector histograms, asymmetry, and Gaussian propagated errors.
 
@@ -329,7 +348,12 @@ def binned_asymmetry(
         (det1 - det2) / (det1 + det2)
     where det1 is detector index 0 and det2 is detector index 1.
     With Poisson Gaussian count errors sqrt(N), error propagation gives
-        sigma_A = sqrt((1 - A^2) / (N1 + N2)).
+        sigma_A = 2 sqrt(N1 N2) / (N1 + N2)^(3/2)
+                = sqrt((1 - A^2) / (N1 + N2)).
+
+    If require_positive_counts is true, bins are marked invalid unless both
+    detectors have at least one count. This is the default used by the binned
+    chi-squared analysis.
     """
     edges = np.linspace(t_min_ns, t_max_ns, bins + 1)
     det0_counts, _ = np.histogram(times_ns[detectors == 0], bins=edges)
@@ -337,11 +361,14 @@ def binned_asymmetry(
     denom = det0_counts + det1_counts
     asym = np.full(bins, np.nan, dtype=float)
     asym_err = np.full(bins, np.nan, dtype=float)
-    valid = denom > 0
+    if require_positive_counts:
+        valid = (det0_counts > 0) & (det1_counts > 0)
+    else:
+        valid = denom > 0
     asym[valid] = (det0_counts[valid] - det1_counts[valid]) / denom[valid]
-    asym_err[valid] = np.sqrt(np.maximum(0.0, (1.0 - asym[valid] ** 2) / denom[valid]))
+    asym_err[valid] = 2.0 * np.sqrt(det0_counts[valid] * det1_counts[valid]) / (denom[valid] ** 1.5)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    return centers, asym, asym_err, det0_counts, det1_counts, edges
+    return centers, asym, asym_err, det0_counts, det1_counts, edges, valid
 
 
 
@@ -368,3 +395,106 @@ def map_asymmetry_prediction(
     valid = denom > 0.0
     prediction[valid] = (w0[valid] - w1[valid]) / denom[valid]
     return prediction
+
+
+
+def _prediction_grid_for_times(
+    times_ns: np.ndarray,
+    *,
+    g_grid: np.ndarray,
+    a2_grid: np.ndarray,
+    b_field_t: float,
+    detector_setup: DetectorSetup,
+    clip_negative_weights: bool = True,
+) -> np.ndarray:
+    """Return model asymmetry r(t) on a time x g x A2 grid."""
+    times_ns = np.asarray(times_ns, dtype=float)
+    g_grid = np.asarray(g_grid, dtype=float)
+    a2_grid = np.asarray(a2_grid, dtype=float)
+    phis = detector_setup.phis_rad
+    eff = detector_setup.efficiencies
+
+    phase = times_ns[:, None] * 1e-9 * omega_from_g_b(g_grid, b_field_t)[None, :]
+    q0 = p2_from_delta(phis[0] - phase)[:, :, None]
+    q1 = p2_from_delta(phis[1] - phase)[:, :, None]
+    a2 = a2_grid[None, None, :]
+
+    w0 = 1.0 + q0 * a2
+    w1 = 1.0 + q1 * a2
+    if clip_negative_weights:
+        w0 = np.clip(w0, 0.0, None)
+        w1 = np.clip(w1, 0.0, None)
+    w0 *= eff[0]
+    w1 *= eff[1]
+
+    denom = w0 + w1
+    prediction = np.full_like(denom, np.nan, dtype=float)
+    valid = denom > 0.0
+    prediction[valid] = (w0[valid] - w1[valid]) / denom[valid]
+    return prediction
+
+
+def compute_chi2_posterior(
+    *,
+    times_ns: np.ndarray,
+    detectors: np.ndarray,
+    b_field_t: float,
+    detector_setup: DetectorSetup,
+    g_grid: np.ndarray,
+    a2_grid: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    bins: int,
+    clip_negative_weights: bool = True,
+) -> ChiSquaredPosteriorResult:
+    """
+    Build a binned chi-squared posterior on the same g x A2 grid.
+
+    The data are binned into detector asymmetries, bins with zero counts in
+    either detector are excluded, and the grid likelihood is
+        L(g,A2) ∝ exp[-chi2(g,A2)/2].
+    """
+    if bins <= 0:
+        raise ValueError("Number of bins must be positive")
+
+    centers, asym, asym_err, det0_counts, det1_counts, _edges, valid_bins = binned_asymmetry(
+        times_ns,
+        detectors,
+        t_min_ns=t_min_ns,
+        t_max_ns=t_max_ns,
+        bins=bins,
+        require_positive_counts=True,
+    )
+
+    chi2 = np.full((len(g_grid), len(a2_grid)), np.inf, dtype=float)
+    if np.any(valid_bins):
+        pred = _prediction_grid_for_times(
+            centers[valid_bins],
+            g_grid=g_grid,
+            a2_grid=a2_grid,
+            b_field_t=b_field_t,
+            detector_setup=detector_setup,
+            clip_negative_weights=clip_negative_weights,
+        )
+        residual = asym[valid_bins, None, None] - pred
+        sigma = asym_err[valid_bins, None, None]
+        term = (residual / sigma) ** 2
+        chi2_candidate = np.sum(term, axis=0)
+        chi2[np.isfinite(chi2_candidate)] = chi2_candidate[np.isfinite(chi2_candidate)]
+
+    posterior = _normalize_log_grid(-0.5 * chi2)
+    max_idx = np.unravel_index(np.argmax(posterior), posterior.shape)
+    return ChiSquaredPosteriorResult(
+        posterior=posterior,
+        chi2=chi2,
+        map_g=float(g_grid[max_idx[0]]),
+        map_a2=float(a2_grid[max_idx[1]]),
+        g_grid=np.asarray(g_grid, dtype=float),
+        a2_grid=np.asarray(a2_grid, dtype=float),
+        bin_centers=centers,
+        asymmetry=asym,
+        asymmetry_error=asym_err,
+        det0_counts=det0_counts,
+        det1_counts=det1_counts,
+        valid_bins=valid_bins,
+    )

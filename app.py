@@ -13,6 +13,7 @@ from tdpad_core import (
     DetectorSetup,
     MU_N_OVER_HBAR_RAD_PER_S_T,
     binned_asymmetry,
+    compute_chi2_posterior,
     compute_posterior_snapshots,
     log_spaced_event_counts,
     map_asymmetry_prediction,
@@ -240,6 +241,7 @@ def make_frame_figure(
     b_field_t: float,
     t_min_ns: float,
     t_max_ns: float,
+    bins: int,
     clip_negative_weights: bool,
 ):
     n_events = int(posterior.event_counts[frame_idx])
@@ -253,10 +255,15 @@ def make_frame_figure(
 
     times = events.times_ns[:n_events]
     dets = events.detectors[:n_events]
-    centers, asym, asym_err, det0_counts, det1_counts, edges = binned_asymmetry(
-        times, dets, t_min_ns=t_min_ns, t_max_ns=t_max_ns, bins=16
+    centers, asym, asym_err, det0_counts, det1_counts, edges, valid_bins = binned_asymmetry(
+        times,
+        dets,
+        t_min_ns=t_min_ns,
+        t_max_ns=t_max_ns,
+        bins=bins,
+        require_positive_counts=True,
     )
-    nonempty = np.isfinite(asym) & np.isfinite(asym_err)
+    nonempty = valid_bins & np.isfinite(asym) & np.isfinite(asym_err)
 
     curve_times = np.linspace(t_min_ns, t_max_ns, 600)
     prediction_curve = map_asymmetry_prediction(
@@ -296,7 +303,7 @@ def make_frame_figure(
     )
     ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="MAP prediction")
     ax_asym.set_ylim(-1.05, 1.05)
-    ax_asym.set_title("16-bin detector asymmetry")
+    ax_asym.set_title(f"{bins}-bin detector asymmetry")
     ax_asym.set_xlabel("time [ns]")
     ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
     ax_asym.legend(loc="best", fontsize=8)
@@ -325,7 +332,7 @@ def make_frame_figure(
     )
 
     fig.suptitle(
-        "TDPAD toy likelihood scan: "
+        "Event-wise likelihood scan: "
         f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}",
         fontsize=14,
     )
@@ -333,11 +340,140 @@ def make_frame_figure(
 
 
 
-st.title("Interactive TDPAD toy simulation and event-wise likelihood scan")
+
+@st.cache_data(show_spinner=False)
+def compute_chi2_snapshot_cached(
+    times_ns: np.ndarray,
+    detectors: np.ndarray,
+    b_field_t: float,
+    phi1_deg: float,
+    phi2_deg: float,
+    g_grid: np.ndarray,
+    a2_grid: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    bins: int,
+    clip_negative_weights: bool,
+):
+    """Cache the binned chi-squared posterior for a slider snapshot."""
+    setup = DetectorSetup(phi1_deg=phi1_deg, phi2_deg=phi2_deg, eff1=1.0, eff2=1.0)
+    return compute_chi2_posterior(
+        times_ns=times_ns,
+        detectors=detectors,
+        b_field_t=b_field_t,
+        detector_setup=setup,
+        g_grid=g_grid,
+        a2_grid=a2_grid,
+        t_min_ns=t_min_ns,
+        t_max_ns=t_max_ns,
+        bins=bins,
+        clip_negative_weights=clip_negative_weights,
+    )
+
+
+def make_chi2_frame_figure(
+    *,
+    events,
+    chi2_result,
+    n_events: int,
+    detector_setup: DetectorSetup,
+    b_field_t: float,
+    t_min_ns: float,
+    t_max_ns: float,
+    bins: int,
+    clip_negative_weights: bool,
+):
+    """Create the second 2x2 figure set for the binned chi-squared analysis."""
+    post = chi2_result.posterior
+    g_grid = chi2_result.g_grid
+    a2_grid = chi2_result.a2_grid
+    g_marginal = post.sum(axis=1)
+    a2_marginal = post.sum(axis=0)
+    map_g = float(chi2_result.map_g)
+    map_a2 = float(chi2_result.map_a2)
+
+    curve_times = np.linspace(t_min_ns, t_max_ns, 600)
+    prediction_curve = map_asymmetry_prediction(
+        curve_times,
+        g=map_g,
+        a2=map_a2,
+        b_field_t=b_field_t,
+        detector_setup=detector_setup,
+        clip_negative_weights=clip_negative_weights,
+    )
+
+    fig = plt.figure(figsize=(12, 9), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.4], width_ratios=[1.15, 1.0])
+    ax_g = fig.add_subplot(gs[0, 0])
+    ax_asym = fig.add_subplot(gs[0, 1])
+    ax_post = fig.add_subplot(gs[1, 0])
+    ax_a2 = fig.add_subplot(gs[1, 1])
+
+    _plot_1d_marginal_with_hpd(
+        ax_g,
+        grid=g_grid,
+        probability=g_marginal,
+        name="g",
+        true_value=events.true_g,
+        map_value=map_g,
+    )
+
+    valid = chi2_result.valid_bins & np.isfinite(chi2_result.asymmetry) & np.isfinite(chi2_result.asymmetry_error)
+    ax_asym.axhline(0.0, linewidth=0.8)
+    ax_asym.errorbar(
+        chi2_result.bin_centers[valid],
+        chi2_result.asymmetry[valid],
+        yerr=chi2_result.asymmetry_error[valid],
+        marker="o",
+        linestyle="",
+        capsize=3,
+        label="binned data ± Gaussian error",
+    )
+    ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="χ² MAP prediction")
+    ax_asym.set_ylim(-1.05, 1.05)
+    ax_asym.set_title(f"{bins}-bin asymmetry used in χ²")
+    ax_asym.set_xlabel("time [ns]")
+    ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
+    ax_asym.legend(loc="best", fontsize=8)
+
+    im = ax_post.imshow(
+        post.T,
+        origin="lower",
+        aspect="auto",
+        extent=[g_grid[0], g_grid[-1], a2_grid[0], a2_grid[-1]],
+    )
+    ax_post.plot(events.true_g, events.true_a2, marker="x", markersize=9, label="true")
+    ax_post.plot(map_g, map_a2, marker="+", markersize=10, label="χ² MAP")
+    ax_post.set_title(f"χ² posterior after {n_events} accepted events")
+    ax_post.set_xlabel("g")
+    ax_post.set_ylabel("A₂")
+    ax_post.legend(loc="best", fontsize=8)
+    fig.colorbar(im, ax=ax_post, label="posterior probability")
+
+    _plot_1d_marginal_with_hpd(
+        ax_a2,
+        grid=a2_grid,
+        probability=a2_marginal,
+        name="A₂",
+        true_value=events.true_a2,
+        map_value=map_a2,
+    )
+
+    valid_count = int(np.sum(chi2_result.valid_bins))
+    fig.suptitle(
+        "Binned χ² likelihood scan: "
+        f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}, "
+        f"valid bins={valid_count}/{bins}",
+        fontsize=14,
+    )
+    return fig
+
+st.title("Interactive TDPAD toy simulation: event-wise and binned χ² scans")
 st.markdown(
     "This app either draws one random `(g, A₂)` pair from flat input ranges or uses "
-    "fixed values, simulates 10,000 raw exponential-decay events, keeps only events "
-    "in the analysis time window, and updates a flat-prior posterior over a `g × A₂` grid."
+    "fixed values, simulates raw exponential-decay events, keeps only events "
+    "in the analysis time window, and compares an event-wise likelihood scan with "
+    "a binned Gaussian χ² scan on the same `g × A₂` grid."
 )
 
 with st.sidebar:
@@ -465,6 +601,27 @@ st.write(
     f"using the first **{selected_count:,} accepted events**."
 )
 
+top_figure_slot = st.empty()
+
+st.divider()
+bins = st.slider(
+    "Number of time bins",
+    min_value=4,
+    max_value=100,
+    value=16,
+    step=1,
+    help=(
+        "Used for the asymmetry visualization in the event-wise plot above, "
+        "and for the full binned χ² analysis below. Bins with zero counts in "
+        "either detector are excluded from the χ² sum."
+    ),
+)
+st.caption(
+    "The bin count slider is placed between the two analysis blocks. It controls "
+    "the top-right asymmetry visualization in the event-wise block, and the full "
+    "binned χ² likelihood block below."
+)
+
 fig = make_frame_figure(
     events=events,
     posterior=posterior,
@@ -473,10 +630,53 @@ fig = make_frame_figure(
     b_field_t=params["b_field_t"],
     t_min_ns=params["t_min_ns"],
     t_max_ns=params["t_max_ns"],
+    bins=int(bins),
     clip_negative_weights=params["clip_negative_weights"],
 )
-st.pyplot(fig, clear_figure=True)
+top_figure_slot.pyplot(fig, clear_figure=True)
 plt.close(fig)
+
+st.subheader("Binned Gaussian χ² analysis")
+with st.spinner("Computing binned χ² posterior for the selected snapshot..."):
+    chi2_result = compute_chi2_snapshot_cached(
+        events.times_ns[:selected_count],
+        events.detectors[:selected_count],
+        params["b_field_t"],
+        params["phi1_deg"],
+        params["phi2_deg"],
+        posterior.g_grid,
+        posterior.a2_grid,
+        params["t_min_ns"],
+        params["t_max_ns"],
+        int(bins),
+        params["clip_negative_weights"],
+    )
+
+valid_chi2_bins = int(np.sum(chi2_result.valid_bins))
+if valid_chi2_bins == 0:
+    st.warning(
+        "No bins have positive counts in both detectors for this snapshot/binning. "
+        "The χ² posterior is therefore uninformative. Use more events or fewer bins."
+    )
+elif valid_chi2_bins < 3:
+    st.info(
+        f"Only {valid_chi2_bins} bins have positive counts in both detectors. "
+        "The χ² result may be very weak; use more events or fewer bins for a stabler scan."
+    )
+
+fig_chi2 = make_chi2_frame_figure(
+    events=events,
+    chi2_result=chi2_result,
+    n_events=selected_count,
+    detector_setup=setup,
+    b_field_t=params["b_field_t"],
+    t_min_ns=params["t_min_ns"],
+    t_max_ns=params["t_max_ns"],
+    bins=int(bins),
+    clip_negative_weights=params["clip_negative_weights"],
+)
+st.pyplot(fig_chi2, clear_figure=True)
+plt.close(fig_chi2)
 
 with st.expander("Implementation notes"):
     st.markdown(
@@ -491,5 +691,8 @@ with st.expander("Implementation notes"):
         "- The 1D marginalized posteriors are plotted as densities, start at zero, and mark "
         "68% / 95% highest-posterior-density regions.\n"
         "- The top-right points use Gaussian error propagation for "
-        "`(det1 - det2) / (det1 + det2)`, and the MAP prediction is drawn as a smooth curve."
+        "`(det1 - det2) / (det1 + det2)`, and the MAP prediction is drawn as a smooth curve.\n"
+        "- The bin slider controls the event-wise asymmetry visualization and the full binned χ² scan. "
+        "Bins with zero counts in either detector are excluded before computing χ².\n"
+        "- The binned likelihood uses `L(g, A₂) ∝ exp(-0.5 χ²(g, A₂))` on the same grid as the event-wise likelihood."
     )
