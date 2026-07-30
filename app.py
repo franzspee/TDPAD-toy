@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import io
+import math
 import time
 
 import matplotlib.pyplot as plt
@@ -11,7 +13,6 @@ import streamlit as st
 
 from tdpad_core import (
     DetectorSetup,
-    MU_N_OVER_HBAR_RAD_PER_S_T,
     binned_asymmetry,
     compute_chi2_posterior,
     compute_posterior_snapshots,
@@ -32,6 +33,12 @@ def _format_float(x: float, digits: int = 5) -> str:
     return f"{x:.{digits}g}"
 
 
+def _figure_as_svg(fig: plt.Figure) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="svg", bbox_inches="tight")
+    return buffer.getvalue()
+
+
 
 def _grid_spacing(grid: np.ndarray) -> float:
     grid = np.asarray(grid, dtype=float)
@@ -49,6 +56,54 @@ def _density_from_grid_probability(grid: np.ndarray, probability: np.ndarray) ->
     if norm <= 0.0 or not np.isfinite(norm):
         return np.zeros_like(density)
     return density / norm
+
+
+def _local_curvature_gaussian_for_marginal(
+    grid: np.ndarray,
+    probability: np.ndarray,
+) -> tuple[float, float, float, bool]:
+    """Return a Gaussian passing through the marginal MAP with matching curvature."""
+    grid = np.asarray(grid, dtype=float)
+    density = _density_from_grid_probability(grid, probability)
+    if len(grid) < 3 or not np.any(np.isfinite(density)) or float(np.sum(density)) <= 0.0:
+        return float("nan"), float("nan"), float("nan"), False
+
+    map_idx = int(np.argmax(density))
+    mu = float(grid[map_idx])
+    peak = float(density[map_idx])
+    if map_idx == 0 or map_idx == len(grid) - 1 or peak <= 0.0 or not np.isfinite(peak):
+        return mu, float("nan"), peak, False
+
+    local_grid = np.asarray(grid[map_idx - 1 : map_idx + 2], dtype=float)
+    local_density = np.asarray(density[map_idx - 1 : map_idx + 2], dtype=float)
+    if not np.all(np.isfinite(local_grid)) or not np.all(np.isfinite(local_density)):
+        return mu, float("nan"), peak, False
+    if not np.all(np.diff(local_grid) > 0.0):
+        return mu, float("nan"), peak, False
+
+    try:
+        quadratic, _linear, _constant = np.polyfit(local_grid, local_density, deg=2)
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return mu, float("nan"), peak, False
+
+    second_derivative = float(2.0 * quadratic)
+    if second_derivative >= 0.0 or not np.isfinite(second_derivative):
+        return mu, float("nan"), peak, False
+
+    sigma = math.sqrt(-peak / second_derivative)
+    return mu, sigma, peak, bool(np.isfinite(sigma) and sigma > 0.0)
+
+
+def _gaussian_density_curve(
+    grid: np.ndarray,
+    *,
+    mu: float,
+    sigma: float,
+    peak: float,
+) -> np.ndarray:
+    """Evaluate a MAP-normalized Gaussian density on a grid."""
+    grid = np.asarray(grid, dtype=float)
+    return peak * np.exp(-0.5 * ((grid - mu) / sigma) ** 2)
 
 
 
@@ -117,6 +172,7 @@ def _plot_1d_marginal_with_hpd(
     name: str,
     true_value: float,
     map_value: float,
+    show_local_gaussian: bool = False,
 ) -> None:
     """Plot a marginalized posterior density with 68% and 95% HPD shading."""
     grid = np.asarray(grid, dtype=float)
@@ -153,6 +209,33 @@ def _plot_1d_marginal_with_hpd(
     )
 
     ax.plot(grid, density, label=f"p({name})")
+    if show_local_gaussian:
+        gaussian_mu, gaussian_sigma, gaussian_peak, gaussian_ok = (
+            _local_curvature_gaussian_for_marginal(grid, probability)
+        )
+        if gaussian_ok:
+            ax.plot(
+                grid,
+                _gaussian_density_curve(
+                    grid,
+                    mu=gaussian_mu,
+                    sigma=gaussian_sigma,
+                    peak=gaussian_peak,
+                ),
+                linestyle="--",
+                linewidth=1.8,
+                label=f"local Gaussian σ={gaussian_sigma:.3g}",
+            )
+        else:
+            ax.text(
+                0.02,
+                0.95,
+                "local Gaussian unavailable",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+            )
     map_idx = int(np.argmin(np.abs(grid - map_value)))
     ax.plot(
         map_value,
@@ -302,7 +385,6 @@ def make_frame_figure(
         label="binned data ± Gaussian error",
     )
     ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="MAP prediction")
-    ax_asym.set_ylim(-1.05, 1.05)
     ax_asym.set_title(f"{bins}-bin detector asymmetry")
     ax_asym.set_xlabel("time [ns]")
     ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
@@ -382,6 +464,7 @@ def make_chi2_frame_figure(
     t_max_ns: float,
     bins: int,
     clip_negative_weights: bool,
+    show_local_gaussian: bool = False,
 ):
     """Create the second 2x2 figure set for the binned chi-squared analysis."""
     post = chi2_result.posterior
@@ -416,6 +499,7 @@ def make_chi2_frame_figure(
         name="g",
         true_value=events.true_g,
         map_value=map_g,
+        show_local_gaussian=show_local_gaussian,
     )
 
     valid = chi2_result.valid_bins & np.isfinite(chi2_result.asymmetry) & np.isfinite(chi2_result.asymmetry_error)
@@ -430,7 +514,6 @@ def make_chi2_frame_figure(
         label="binned data ± Gaussian error",
     )
     ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="χ² MAP prediction")
-    ax_asym.set_ylim(-1.05, 1.05)
     ax_asym.set_title(f"{bins}-bin asymmetry used in χ²")
     ax_asym.set_xlabel("time [ns]")
     ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
@@ -478,16 +561,16 @@ st.markdown(
 
 with st.sidebar:
     st.header("Simulation inputs")
-    lifetime_ns = st.number_input("Lifetime τ [ns]", min_value=0.001, value=100.0, step=10.0)
-    b_field_t = st.number_input("Magnetic field B [T]", value=0.5, step=0.1, format="%.6g")
+    lifetime_ns = st.number_input("Lifetime τ [ns]", min_value=0.001, value=1300.0, step=10.0)
+    b_field_t = st.number_input("Magnetic field B [T]", value=0.15, step=0.1, format="%.6g")
 
     st.subheader("Two detector angles")
-    phi1_deg = st.number_input("Detector 1 angle θ₁ [deg]", value=0.0, step=5.0, format="%.6g")
-    phi2_deg = st.number_input("Detector 2 angle θ₂ [deg]", value=90.0, step=5.0, format="%.6g")
+    phi1_deg = st.number_input("Detector 1 angle θ₁ [deg]", value=45.0, step=5.0, format="%.6g")
+    phi2_deg = st.number_input("Detector 2 angle θ₂ [deg]", value=135.0, step=5.0, format="%.6g")
 
     st.subheader("Analysis time window")
-    t_min_ns = st.number_input("t_min [ns]", value=0.0, step=10.0, format="%.6g")
-    t_max_ns = st.number_input("t_max [ns]", value=500.0, step=10.0, format="%.6g")
+    t_min_ns = st.number_input("t_min [ns]", value=300.0, step=10.0, format="%.6g")
+    t_max_ns = st.number_input("t_max [ns]", value=3000.0, step=10.0, format="%.6g")
 
     st.subheader("Analysis grid / draw ranges")
     g_min, g_max = st.slider("g range", -2.0, 2.0, (-0.5, 0.5), step=0.01)
@@ -512,6 +595,14 @@ with st.sidebar:
     grid_points = st.number_input("Grid points per axis", min_value=20, max_value=200, value=100, step=10)
     n_frames = st.number_input("Slider snapshots", min_value=10, max_value=200, value=100, step=10)
     clip_negative_weights = st.checkbox("Clip negative W weights", value=True)
+    show_local_gaussian = st.checkbox(
+        "Fit local Gaussian through g MAP",
+        value=False,
+        help=(
+            "Overlay a Gaussian on the binned g marginal that passes through its MAP "
+            "and matches the posterior's local curvature."
+        ),
+    )
 
     run_button = st.button("Simulate / rescan", type="primary")
 
@@ -572,12 +663,16 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("True g", _format_float(events.true_g, 6))
 col2.metric("True A₂", _format_float(events.true_a2, 6))
 col3.metric("Accepted events", f"{events.accepted_events:,} / {events.raw_events_generated:,}")
-col4.metric("ω [rad/s]", _format_float(events.omega_rad_per_s, 6))
+larmor_period_ns = (
+    2.0 * np.pi / abs(events.omega_rad_per_s) * 1e9
+    if events.omega_rad_per_s != 0.0
+    else np.inf
+)
+col4.metric("Period [ns]", _format_float(larmor_period_ns, 6))
 
 st.caption(
-    f"True parameters are `{events.true_parameter_mode}`. Likelihood convention: "
-    f"ω = g μ_N B / ℏ, with μ_N/ℏ = "
-    f"{MU_N_OVER_HBAR_RAD_PER_S_T:.6g} rad s⁻¹ T⁻¹. "
+    f"True parameters are `{events.true_parameter_mode}`. The displayed Larmor period is "
+    f"T = 2π / |ω|. "
     f"Computation time for current cached run: {elapsed:.2f} s."
 )
 
@@ -633,8 +728,15 @@ fig = make_frame_figure(
     bins=int(bins),
     clip_negative_weights=params["clip_negative_weights"],
 )
+fig_svg = _figure_as_svg(fig)
 top_figure_slot.pyplot(fig, clear_figure=True)
 plt.close(fig)
+st.download_button(
+    "Download event-wise figure as SVG",
+    data=fig_svg,
+    file_name=f"event_wise_snapshot_{frame_idx + 1}.svg",
+    mime="image/svg+xml",
+)
 
 st.subheader("Binned Gaussian χ² analysis")
 with st.spinner("Computing binned χ² posterior for the selected snapshot..."):
@@ -674,9 +776,17 @@ fig_chi2 = make_chi2_frame_figure(
     t_max_ns=params["t_max_ns"],
     bins=int(bins),
     clip_negative_weights=params["clip_negative_weights"],
+    show_local_gaussian=show_local_gaussian,
 )
+fig_chi2_svg = _figure_as_svg(fig_chi2)
 st.pyplot(fig_chi2, clear_figure=True)
 plt.close(fig_chi2)
+st.download_button(
+    "Download binned χ² figure as SVG",
+    data=fig_chi2_svg,
+    file_name=f"binned_chi2_snapshot_{frame_idx + 1}.svg",
+    mime="image/svg+xml",
+)
 
 with st.expander("Implementation notes"):
     st.markdown(
