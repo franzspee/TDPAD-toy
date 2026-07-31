@@ -385,9 +385,9 @@ def make_frame_figure(
         label="binned data ± Gaussian error",
     )
     ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="MAP prediction")
-    ax_asym.set_title(f"{bins}-bin detector asymmetry")
+    ax_asym.set_title(f"R(t) visualization using {bins} bins")
     ax_asym.set_xlabel("time [ns]")
-    ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
+    ax_asym.set_ylabel("R(t)")
     ax_asym.legend(loc="best", fontsize=8)
 
     im = ax_post.imshow(
@@ -414,7 +414,7 @@ def make_frame_figure(
     )
 
     fig.suptitle(
-        "Event-wise likelihood scan: "
+        "Binning-independent analysis:\n "
         f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}",
         fontsize=14,
     )
@@ -514,9 +514,9 @@ def make_chi2_frame_figure(
         label="binned data ± Gaussian error",
     )
     ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="χ² MAP prediction")
-    ax_asym.set_title(f"{bins}-bin asymmetry used in χ²")
+    ax_asym.set_title(f"R(t) fit using {bins} bins")
     ax_asym.set_xlabel("time [ns]")
-    ax_asym.set_ylabel("(det1 - det2) / (det1 + det2)")
+    ax_asym.set_ylabel("R(t)")
     ax_asym.legend(loc="best", fontsize=8)
 
     im = ax_post.imshow(
@@ -544,19 +544,19 @@ def make_chi2_frame_figure(
 
     valid_count = int(np.sum(chi2_result.valid_bins))
     fig.suptitle(
-        "Binned χ² likelihood scan: "
+        "Binning-dependent analysis:\n "
         f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}, "
         f"valid bins={valid_count}/{bins}",
         fontsize=14,
     )
     return fig
 
-st.title("Interactive TDPAD toy simulation: event-wise and binned χ² scans")
+st.title("Interactive TDPAD toy simulation and analysis")
 st.markdown(
-    "This app either draws one random `(g, A₂)` pair from flat input ranges or uses "
-    "fixed values, simulates raw exponential-decay events, keeps only events "
-    "in the analysis time window, and compares an event-wise likelihood scan with "
-    "a binned Gaussian χ² scan on the same `g × A₂` grid."
+    "This app simulates Time-Dependent Angular Distribution data for a given level of statistics. "
+    "The data are then analyzed in a Bayesian framework using first a binning-*independent* likelihood and then a binning-*dependent* likelihood."
+    "For both approaches, a corner plot is shown with the marginalized posteriors for the two parameters of interest, `g` and `A₂`, as well as the detector asymmetry as a function of time."
+    "For details see the implementation notes at the bottom of the page."
 )
 
 with st.sidebar:
@@ -565,16 +565,16 @@ with st.sidebar:
     b_field_t = st.number_input("Magnetic field B [T]", value=0.15, step=0.1, format="%.6g")
 
     st.subheader("Two detector angles")
-    phi1_deg = st.number_input("Detector 1 angle θ₁ [deg]", value=45.0, step=5.0, format="%.6g")
-    phi2_deg = st.number_input("Detector 2 angle θ₂ [deg]", value=135.0, step=5.0, format="%.6g")
+    phi1_deg = st.number_input("Detector 0 angle θ₀ [deg]", value=45.0, step=5.0, format="%.6g")
+    phi2_deg = st.number_input("Detector 1 angle θ₁ [deg]", value=135.0, step=5.0, format="%.6g")
 
     st.subheader("Analysis time window")
     t_min_ns = st.number_input("t_min [ns]", value=300.0, step=10.0, format="%.6g")
     t_max_ns = st.number_input("t_max [ns]", value=3000.0, step=10.0, format="%.6g")
 
-    st.subheader("Analysis grid / draw ranges")
+    st.subheader("Flat Prior and Draw ranges")
     g_min, g_max = st.slider("g range", -2.0, 2.0, (-0.5, 0.5), step=0.01)
-    a2_min, a2_max = st.slider("A₂ range", -2.0, 2.0, (-0.4, 0.4), step=0.01)
+    a2_min, a2_max = st.slider("A₂ range", -1.0, 1.0, (-0.4, 0.4), step=0.01)
 
     st.subheader("True parameter choice")
     true_parameter_mode = st.radio(
@@ -583,7 +583,9 @@ with st.sidebar:
         index=0,
     )
     fixed_g = st.number_input("Fixed true g", value=0.2, step=0.01, format="%.6g")
-    fixed_a2 = st.number_input("Fixed true A₂", value=0.2, step=0.01, format="%.6g")
+    fixed_a2 = st.number_input(
+        "Fixed true A₂", min_value=-1.0, max_value=1.0, value=0.2, step=0.01, format="%.6g"
+    )
     if true_parameter_mode == "Draw uniformly from ranges":
         st.caption("The fixed-value fields are ignored in draw mode.")
     else:
@@ -594,7 +596,6 @@ with st.sidebar:
     raw_events = st.number_input("Raw events to generate", min_value=100, max_value=200_000, value=10_000, step=1_000)
     grid_points = st.number_input("Grid points per axis", min_value=20, max_value=200, value=100, step=10)
     n_frames = st.number_input("Slider snapshots", min_value=10, max_value=200, value=100, step=10)
-    clip_negative_weights = st.checkbox("Clip negative W weights", value=True)
     show_local_gaussian = st.checkbox(
         "Fit local Gaussian through g MAP",
         value=False,
@@ -640,13 +641,16 @@ params = dict(
     raw_events=int(raw_events),
     grid_points=int(grid_points),
     n_frames=int(n_frames),
-    clip_negative_weights=bool(clip_negative_weights),
+    clip_negative_weights=False,
 )
 
 if run_button or "last_params" not in st.session_state:
     st.session_state.last_params = params
 else:
     params = st.session_state.last_params
+
+# W is non-negative throughout the selectable A₂ range, so clipping is unnecessary.
+params["clip_negative_weights"] = False
 
 try:
     with st.spinner("Simulating events and scanning likelihood grid..."):
@@ -668,11 +672,11 @@ larmor_period_ns = (
     if events.omega_rad_per_s != 0.0
     else np.inf
 )
-col4.metric("Period [ns]", _format_float(larmor_period_ns, 6))
+col4.metric("Period [ns]", _format_float(larmor_period_ns/2, 6))
 
 st.caption(
-    f"True parameters are `{events.true_parameter_mode}`. The displayed Larmor period is "
-    f"T = 2π / |ω|. "
+    f"True parameters are `{events.true_parameter_mode}`. The displayed period is "
+    f"T = π / |ω|. "
     f"Computation time for current cached run: {elapsed:.2f} s."
 )
 
@@ -732,7 +736,7 @@ fig_svg = _figure_as_svg(fig)
 top_figure_slot.pyplot(fig, clear_figure=True)
 plt.close(fig)
 st.download_button(
-    "Download event-wise figure as SVG",
+    "Download binning-independent figure as SVG",
     data=fig_svg,
     file_name=f"event_wise_snapshot_{frame_idx + 1}.svg",
     mime="image/svg+xml",
@@ -782,7 +786,7 @@ fig_chi2_svg = _figure_as_svg(fig_chi2)
 st.pyplot(fig_chi2, clear_figure=True)
 plt.close(fig_chi2)
 st.download_button(
-    "Download binned χ² figure as SVG",
+    "Download binning-dependent figure as SVG",
     data=fig_chi2_svg,
     file_name=f"binned_chi2_snapshot_{frame_idx + 1}.svg",
     mime="image/svg+xml",
@@ -790,19 +794,58 @@ st.download_button(
 
 with st.expander("Implementation notes"):
     st.markdown(
-        "- Event times are drawn from an untruncated exponential with lifetime τ; "
-        "only events inside `[t_min, t_max]` are retained, so the accepted sample can "
-        "contain fewer than the raw 10,000 generated events.\n"
-        "- Detector efficiencies are hard-coded to 1 for both detectors.\n"
+        "**Data generation**\n"
+        "- Single events are of the form `(i, t)` where `i` is the detector index (either 0 or 1) and `t` is the time in ns.\n"
+        "- The event generation uses the standard TDPAD angular distribution formula:"
+    )
+    st.latex(
+        r"""
+        \begin{aligned}
+        p(i,t) &\propto \epsilon(i)\,\exp(-\lambda t)\,
+        W\!\left(\theta(i),t\right) \\[0.4em]
+        W(\theta,t) &= 1 + A_2\left[
+        \frac{1}{4} + \frac{3}{4}
+        \cos\!\left(2\theta - 2 g \mu_N \frac{B}{\hbar} t\right)
+        \right].
+        \end{aligned}
+        """
+    )
+    st.markdown(
         "- True `g` and `A₂` can either be drawn uniformly from the displayed ranges or fixed manually.\n"
-        "- The prior over the displayed `g × A₂` grid is flat.\n"
-        "- The posterior snapshots are cumulative: each likelihood product contains all "
-        "accepted events up to the selected snapshot.\n"
-        "- The 1D marginalized posteriors are plotted as densities, start at zero, and mark "
-        "68% / 95% highest-posterior-density regions.\n"
-        "- The top-right points use Gaussian error propagation for "
-        "`(det1 - det2) / (det1 + det2)`, and the MAP prediction is drawn as a smooth curve.\n"
-        "- The bin slider controls the event-wise asymmetry visualization and the full binned χ² scan. "
-        "Bins with zero counts in either detector are excluded before computing χ².\n"
-        "- The binned likelihood uses `L(g, A₂) ∝ exp(-0.5 χ²(g, A₂))` on the same grid as the event-wise likelihood."
+        "- Only events inside the observration window`[t_min, t_max]` are retained, so the accepted sample can "
+        "contain fewer than the raw number of generated events.\n"
+        "- Detector efficiencies are hard-coded to 1 for both detectors.\n"
+        " \n**Data analysis**\n"
+        "- The prior over the displayed `g × A₂` range is flat.\n"
+        "- The binning-independent likelihood is given by:"
+    )
+    st.latex(
+        r"""
+        \begin{aligned}
+        p(i_k|t_k)=\frac{  W\left(\theta(i_k),t_k\right)}
+        {\sum_{j=0}^{I-1}   W\left(\theta(j),t_k\right)},\\[0.4em]
+        \mathcal L(g,A_2|\mathcal D) = \prod_{k=0}^{K-1} p(i_k|t_k)        
+        \end{aligned}
+        """
+    )
+    st.markdown(
+        "- The binning-dependent likelihood is given by:"
+    )
+    st.latex(
+        r"""
+        \begin{aligned}
+        R(t)=\frac{p(0,t)-p(1,t)}{p(0,t)+p(1,t)},\\[0.4em]
+        \mathcal L(g,A_2|\mathcal D) \propto \exp\left(-\frac{1}{2}\sum_{\tilde k}\frac{(R^{exp}_{\tilde k}-R^{theo}(t_{\tilde k}))^2}{(\Delta R_{\tilde k}^{exp})^2}\right)
+        \end{aligned}
+        """
+    )
+    st.markdown(     
+        "- Bins with zero counts in either detector are excluded from the binnning dependent analysis. The number of bins can be adjusted with a slider.\n" 
+        "- The posterior is computed on a uniform grid in `g × A₂` space, and the MAP is found by locating the grid point with the maximum posterior probability. The number of grid points can be adjusted.\n"
+        "- The posterior snapshots are cumulative: The analysis uses all accepted events up to the selected snapshot.\n"
+        "\n**Interpretation**\n"
+        "- In the marginalized 1D posteriors, the 68% and 95% highest-posterior-density (HPD) regions are shaded in light green. The MAP is marked with a red cross, and the true value is marked with a dashed line.\n"
+        "- Note the different character of the top-right figure. For the binning-independent analysis, it serves only as a visualization and a different binning has no influcence on the posterior."
+        "For the binning-dependent analysis, the top-right figure is used to compute the likelihood and a different bin size will result in a different posterior.\n"
+        "- A local Gaussian can be fit to the g marginal posterior to visualize a classical uncertainty estimate.\n"
     )
