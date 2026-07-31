@@ -573,8 +573,8 @@ with st.sidebar:
     t_max_ns = st.number_input("t_max [ns]", value=3000.0, step=10.0, format="%.6g")
 
     st.subheader("Flat Prior and Draw ranges")
-    g_min, g_max = st.slider("g range", -2.0, 2.0, (-0.5, 0.5), step=0.01)
-    a2_min, a2_max = st.slider("A₂ range", -1.0, 1.0, (-0.4, 0.4), step=0.01)
+    g_min, g_max = st.slider("g range", -2.0, 2.0, (0.05, 1.05), step=0.01)
+    a2_min, a2_max = st.slider("A₂ range", -1.0, 1.0, (0.0, 0.3), step=0.01)
 
     st.subheader("True parameter choice")
     true_parameter_mode = st.radio(
