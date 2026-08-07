@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import io
 import math
+from pathlib import Path
 import time
 
 import matplotlib.pyplot as plt
@@ -13,245 +13,73 @@ import streamlit as st
 
 from tdpad_core import (
     DetectorSetup,
-    binned_asymmetry,
     compute_chi2_posterior,
     compute_posterior_snapshots,
     log_spaced_event_counts,
-    map_asymmetry_prediction,
     simulate_events,
 )
+from tdpad_plotting import figure_as_svg, make_chi2_frame_figure, make_frame_figure
 
 
 st.set_page_config(page_title="TDPAD toy simulation", layout="wide")
-
-
-HPD_COLOR = "lightgreen"
-
 
 
 def _format_float(x: float, digits: int = 5) -> str:
     return f"{x:.{digits}g}"
 
 
-def _figure_as_svg(fig: plt.Figure) -> bytes:
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="svg", bbox_inches="tight")
-    return buffer.getvalue()
-
-
-
-def _grid_spacing(grid: np.ndarray) -> float:
-    grid = np.asarray(grid, dtype=float)
-    if len(grid) < 2:
-        return 1.0
-    return float(np.mean(np.diff(grid)))
-
-
-
-def _density_from_grid_probability(grid: np.ndarray, probability: np.ndarray) -> np.ndarray:
-    """Convert a discrete grid probability vector into an approximate density."""
-    density = np.asarray(probability, dtype=float).copy()
-    dx = _grid_spacing(grid)
-    norm = float(np.sum(density) * dx)
-    if norm <= 0.0 or not np.isfinite(norm):
-        return np.zeros_like(density)
-    return density / norm
-
-
-def _local_curvature_gaussian_for_marginal(
-    grid: np.ndarray,
-    probability: np.ndarray,
-) -> tuple[float, float, float, bool]:
-    """Return a Gaussian passing through the marginal MAP with matching curvature."""
-    grid = np.asarray(grid, dtype=float)
-    density = _density_from_grid_probability(grid, probability)
-    if len(grid) < 3 or not np.any(np.isfinite(density)) or float(np.sum(density)) <= 0.0:
-        return float("nan"), float("nan"), float("nan"), False
-
-    map_idx = int(np.argmax(density))
-    mu = float(grid[map_idx])
-    peak = float(density[map_idx])
-    if map_idx == 0 or map_idx == len(grid) - 1 or peak <= 0.0 or not np.isfinite(peak):
-        return mu, float("nan"), peak, False
-
-    local_grid = np.asarray(grid[map_idx - 1 : map_idx + 2], dtype=float)
-    local_density = np.asarray(density[map_idx - 1 : map_idx + 2], dtype=float)
-    if not np.all(np.isfinite(local_grid)) or not np.all(np.isfinite(local_density)):
-        return mu, float("nan"), peak, False
-    if not np.all(np.diff(local_grid) > 0.0):
-        return mu, float("nan"), peak, False
-
-    try:
-        quadratic, _linear, _constant = np.polyfit(local_grid, local_density, deg=2)
-    except (TypeError, ValueError, np.linalg.LinAlgError):
-        return mu, float("nan"), peak, False
-
-    second_derivative = float(2.0 * quadratic)
-    if second_derivative >= 0.0 or not np.isfinite(second_derivative):
-        return mu, float("nan"), peak, False
-
-    sigma = math.sqrt(-peak / second_derivative)
-    return mu, sigma, peak, bool(np.isfinite(sigma) and sigma > 0.0)
-
-
-def _gaussian_density_curve(
-    grid: np.ndarray,
+def _validate_analysis_inputs(
     *,
-    mu: float,
-    sigma: float,
-    peak: float,
-) -> np.ndarray:
-    """Evaluate a MAP-normalized Gaussian density on a grid."""
-    grid = np.asarray(grid, dtype=float)
-    return peak * np.exp(-0.5 * ((grid - mu) / sigma) ** 2)
-
-
-
-def _credible_density_level_1d(
-    density: np.ndarray,
-    dx: float,
-    credible_mass: float,
-) -> float:
-    """Density threshold for a 1D highest-posterior-density region."""
-    density = np.asarray(density, dtype=float)
-    if not 0.0 < credible_mass < 1.0:
-        raise ValueError("credible_mass must be between 0 and 1")
-    finite = np.isfinite(density)
-    if not np.any(finite):
-        return np.inf
-
-    sorted_density = np.sort(density[finite])[::-1]
-    cumulative_mass = np.cumsum(sorted_density * dx)
-    idx = int(np.searchsorted(cumulative_mass, credible_mass, side="left"))
-    idx = min(idx, len(sorted_density) - 1)
-    return float(sorted_density[idx])
-
-
-
-def _fill_masked_regions_under_curve(
-    ax: plt.Axes,
-    *,
-    grid: np.ndarray,
-    density: np.ndarray,
-    mask: np.ndarray,
-    color: str,
-    alpha: float,
-    label: str,
+    lifetime_ns: float,
+    b_field_t: float,
+    phi1_deg: float,
+    phi2_deg: float,
+    t_min_ns: float,
+    t_max_ns: float,
+    g_min: float,
+    g_max: float,
+    a2_min: float,
+    a2_max: float,
+    true_parameter_mode: str,
+    fixed_g: float,
+    fixed_a2: float,
+    raw_events: int,
+    grid_points: int,
+    n_frames: int,
 ) -> None:
-    """Fill contiguous masked regions under a 1D density curve."""
-    grid = np.asarray(grid, dtype=float)
-    density = np.asarray(density, dtype=float)
-    mask = np.asarray(mask, dtype=bool)
-    if len(grid) == 0 or not np.any(mask):
-        return
-
-    padded = np.r_[False, mask, False]
-    starts = np.flatnonzero(~padded[:-1] & padded[1:])
-    stops = np.flatnonzero(padded[:-1] & ~padded[1:])
-
-    first = True
-    for start, stop in zip(starts, stops):
-        region = slice(start, stop)
-        ax.fill_between(
-            grid[region],
-            0.0,
-            density[region],
-            color=color,
-            alpha=alpha,
-            label=label if first else None,
-        )
-        first = False
-
-
-
-def _plot_1d_marginal_with_hpd(
-    ax: plt.Axes,
-    *,
-    grid: np.ndarray,
-    probability: np.ndarray,
-    name: str,
-    true_value: float,
-    map_value: float,
-    show_local_gaussian: bool = False,
-) -> None:
-    """Plot a marginalized posterior density with 68% and 95% HPD shading."""
-    grid = np.asarray(grid, dtype=float)
-    density = _density_from_grid_probability(grid, probability)
-    dx = _grid_spacing(grid)
-
-    if np.sum(density) <= 0.0 or not np.any(np.isfinite(density)):
-        ax.text(0.5, 0.5, "invalid marginal", transform=ax.transAxes, ha="center", va="center")
-        ax.set_title(f"Marginal posterior in {name}")
-        return
-
-    level68 = _credible_density_level_1d(density, dx, credible_mass=0.68)
-    level95 = _credible_density_level_1d(density, dx, credible_mass=0.95)
-    mask68 = density >= level68
-    mask95 = density >= level95
-
-    _fill_masked_regions_under_curve(
-        ax,
-        grid=grid,
-        density=density,
-        mask=mask95,
-        color=HPD_COLOR,
-        alpha=0.35,
-        label="95% HPD region",
-    )
-    _fill_masked_regions_under_curve(
-        ax,
-        grid=grid,
-        density=density,
-        mask=mask68,
-        color=HPD_COLOR,
-        alpha=0.75,
-        label="68% HPD region",
-    )
-
-    ax.plot(grid, density, label=f"p({name})")
-    if show_local_gaussian:
-        gaussian_mu, gaussian_sigma, gaussian_peak, gaussian_ok = (
-            _local_curvature_gaussian_for_marginal(grid, probability)
-        )
-        if gaussian_ok:
-            ax.plot(
-                grid,
-                _gaussian_density_curve(
-                    grid,
-                    mu=gaussian_mu,
-                    sigma=gaussian_sigma,
-                    peak=gaussian_peak,
-                ),
-                linestyle="--",
-                linewidth=1.8,
-                label=f"local Gaussian σ={gaussian_sigma:.3g}",
-            )
-        else:
-            ax.text(
-                0.02,
-                0.95,
-                "local Gaussian unavailable",
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=8,
-            )
-    map_idx = int(np.argmin(np.abs(grid - map_value)))
-    ax.plot(
-        map_value,
-        density[map_idx],
-        "rx",
-        markersize=8,
-        markeredgewidth=1.5,
-        label="MAP",
-    )
-    ax.axvline(true_value, linestyle="--", linewidth=1.5, label=f"true {name}")
-    ax.axvline(map_value, linestyle=":", linewidth=1.5, label=f"MAP {name}")
-    ax.set_title(f"Marginal posterior in {name}")
-    ax.set_xlabel(name)
-    ax.set_ylabel("posterior density")
-    ax.set_ylim(bottom=0.0)
-    ax.legend(loc="best", fontsize=8)
+    """Validate all user inputs once before simulation and analysis."""
+    if not math.isfinite(lifetime_ns) or lifetime_ns <= 0.0:
+        raise ValueError("Lifetime must be finite and positive")
+    if not math.isfinite(b_field_t):
+        raise ValueError("Magnetic field must be finite")
+    if not math.isfinite(phi1_deg) or not math.isfinite(phi2_deg):
+        raise ValueError("Detector angles must be finite")
+    if not math.isfinite(t_min_ns) or not math.isfinite(t_max_ns):
+        raise ValueError("Time-window limits must be finite")
+    if t_max_ns <= t_min_ns:
+        raise ValueError("t_max must be larger than t_min")
+    if not math.isfinite(g_min) or not math.isfinite(g_max):
+        raise ValueError("g-range limits must be finite")
+    if g_max <= g_min:
+        raise ValueError("g range must have min < max")
+    if not math.isfinite(a2_min) or not math.isfinite(a2_max):
+        raise ValueError("A₂-range limits must be finite")
+    if a2_max <= a2_min:
+        raise ValueError("A₂ range must have min < max")
+    if a2_min <= -1.0 or a2_max >= 1.0:
+        raise ValueError("A₂ range must satisfy -1 < A₂ < 1")
+    if not math.isfinite(fixed_g):
+        raise ValueError("Fixed true g must be finite")
+    if not math.isfinite(fixed_a2) or abs(fixed_a2) >= 1.0:
+        raise ValueError("Fixed true A₂ must satisfy -1 < A₂ < 1")
+    if true_parameter_mode not in {"Draw uniformly from ranges", "Set fixed g and A₂"}:
+        raise ValueError("Unknown true-parameter mode")
+    if raw_events <= 0:
+        raise ValueError("Raw event count must be positive")
+    if grid_points <= 0:
+        raise ValueError("Grid point count must be positive")
+    if n_frames <= 0:
+        raise ValueError("Snapshot count must be positive")
 
 
 
@@ -274,9 +102,26 @@ def run_analysis_cached(
     raw_events: int,
     grid_points: int,
     n_frames: int,
-    clip_negative_weights: bool,
 ):
-    setup = DetectorSetup(phi1_deg=phi1_deg, phi2_deg=phi2_deg, eff1=1.0, eff2=1.0)
+    _validate_analysis_inputs(
+        lifetime_ns=lifetime_ns,
+        b_field_t=b_field_t,
+        phi1_deg=phi1_deg,
+        phi2_deg=phi2_deg,
+        t_min_ns=t_min_ns,
+        t_max_ns=t_max_ns,
+        g_min=g_min,
+        g_max=g_max,
+        a2_min=a2_min,
+        a2_max=a2_max,
+        true_parameter_mode=true_parameter_mode,
+        fixed_g=fixed_g,
+        fixed_a2=fixed_a2,
+        raw_events=raw_events,
+        grid_points=grid_points,
+        n_frames=n_frames,
+    )
+    setup = DetectorSetup(phi1_deg=phi1_deg, phi2_deg=phi2_deg)
 
     use_fixed = true_parameter_mode == "Set fixed g and A₂"
     events = simulate_events(
@@ -287,11 +132,10 @@ def run_analysis_cached(
         t_max_ns=t_max_ns,
         g_range=(g_min, g_max),
         a2_range=(a2_min, a2_max),
-        true_g=float(fixed_g) if use_fixed else None,
-        true_a2=float(fixed_a2) if use_fixed else None,
+        true_g=fixed_g if use_fixed else None,
+        true_a2=fixed_a2 if use_fixed else None,
         raw_events=raw_events,
         seed=seed,
-        clip_negative_weights=clip_negative_weights,
     )
 
     if events.accepted_events == 0:
@@ -308,121 +152,9 @@ def run_analysis_cached(
         g_grid=g_grid,
         a2_grid=a2_grid,
         event_counts=event_counts,
-        clip_negative_weights=clip_negative_weights,
     )
 
     return events, posterior
-
-
-
-def make_frame_figure(
-    *,
-    events,
-    posterior,
-    frame_idx: int,
-    detector_setup: DetectorSetup,
-    b_field_t: float,
-    t_min_ns: float,
-    t_max_ns: float,
-    bins: int,
-    clip_negative_weights: bool,
-):
-    n_events = int(posterior.event_counts[frame_idx])
-    post = posterior.posteriors[frame_idx]
-    g_grid = posterior.g_grid
-    a2_grid = posterior.a2_grid
-    g_marginal = post.sum(axis=1)
-    a2_marginal = post.sum(axis=0)
-    map_g = float(posterior.map_g[frame_idx])
-    map_a2 = float(posterior.map_a2[frame_idx])
-
-    times = events.times_ns[:n_events]
-    dets = events.detectors[:n_events]
-    centers, asym, asym_err, det0_counts, det1_counts, edges, valid_bins = binned_asymmetry(
-        times,
-        dets,
-        t_min_ns=t_min_ns,
-        t_max_ns=t_max_ns,
-        bins=bins,
-        require_positive_counts=True,
-    )
-    nonempty = valid_bins & np.isfinite(asym) & np.isfinite(asym_err)
-
-    curve_times = np.linspace(t_min_ns, t_max_ns, 600)
-    prediction_curve = map_asymmetry_prediction(
-        curve_times,
-        g=map_g,
-        a2=map_a2,
-        b_field_t=b_field_t,
-        detector_setup=detector_setup,
-        clip_negative_weights=clip_negative_weights,
-    )
-
-    fig = plt.figure(figsize=(12, 9), constrained_layout=True)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.4], width_ratios=[1.15, 1.0])
-    ax_g = fig.add_subplot(gs[0, 0])
-    ax_asym = fig.add_subplot(gs[0, 1])
-    ax_post = fig.add_subplot(gs[1, 0])
-    ax_a2 = fig.add_subplot(gs[1, 1])
-
-    _plot_1d_marginal_with_hpd(
-        ax_g,
-        grid=g_grid,
-        probability=g_marginal,
-        name="g",
-        true_value=events.true_g,
-        map_value=map_g,
-    )
-
-    ax_asym.axhline(0.0, linewidth=0.8)
-    ax_asym.errorbar(
-        centers[nonempty],
-        asym[nonempty],
-        yerr=asym_err[nonempty],
-        marker="o",
-        linestyle="",
-        capsize=3,
-        label="binned data ± Gaussian error",
-    )
-    ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="MAP prediction")
-    ax_asym.set_title(f"R(t) visualization using {bins} bins")
-    ax_asym.set_xlabel("time [ns]")
-    ax_asym.set_ylabel("R(t)")
-    ax_asym.legend(loc="best", fontsize=8)
-
-    im = ax_post.imshow(
-        post.T,
-        origin="lower",
-        aspect="auto",
-        extent=[g_grid[0], g_grid[-1], a2_grid[0], a2_grid[-1]],
-    )
-    ax_post.plot(events.true_g, events.true_a2, marker="x", markersize=9, label="true")
-    ax_post.plot(map_g, map_a2, marker="+", markersize=10, label="MAP")
-    ax_post.set_title(f"Posterior after {n_events} accepted events")
-    ax_post.set_xlabel("g")
-    ax_post.set_ylabel("A₂")
-    ax_post.legend(loc="best", fontsize=8)
-    fig.colorbar(im, ax=ax_post, label="posterior probability")
-
-    _plot_1d_marginal_with_hpd(
-        ax_a2,
-        grid=a2_grid,
-        probability=a2_marginal,
-        name="A₂",
-        true_value=events.true_a2,
-        map_value=map_a2,
-    )
-
-    fig.suptitle(
-        "Binning-independent analysis:\n "
-        f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}",
-        fontsize=14,
-    )
-    return fig
-
-
-
-
 @st.cache_data(show_spinner=False)
 def compute_chi2_snapshot_cached(
     times_ns: np.ndarray,
@@ -435,10 +167,9 @@ def compute_chi2_snapshot_cached(
     t_min_ns: float,
     t_max_ns: float,
     bins: int,
-    clip_negative_weights: bool,
 ):
     """Cache the binned chi-squared posterior for a slider snapshot."""
-    setup = DetectorSetup(phi1_deg=phi1_deg, phi2_deg=phi2_deg, eff1=1.0, eff2=1.0)
+    setup = DetectorSetup(phi1_deg=phi1_deg, phi2_deg=phi2_deg)
     return compute_chi2_posterior(
         times_ns=times_ns,
         detectors=detectors,
@@ -449,108 +180,7 @@ def compute_chi2_snapshot_cached(
         t_min_ns=t_min_ns,
         t_max_ns=t_max_ns,
         bins=bins,
-        clip_negative_weights=clip_negative_weights,
     )
-
-
-def make_chi2_frame_figure(
-    *,
-    events,
-    chi2_result,
-    n_events: int,
-    detector_setup: DetectorSetup,
-    b_field_t: float,
-    t_min_ns: float,
-    t_max_ns: float,
-    bins: int,
-    clip_negative_weights: bool,
-    show_local_gaussian: bool = False,
-):
-    """Create the second 2x2 figure set for the binned chi-squared analysis."""
-    post = chi2_result.posterior
-    g_grid = chi2_result.g_grid
-    a2_grid = chi2_result.a2_grid
-    g_marginal = post.sum(axis=1)
-    a2_marginal = post.sum(axis=0)
-    map_g = float(chi2_result.map_g)
-    map_a2 = float(chi2_result.map_a2)
-
-    curve_times = np.linspace(t_min_ns, t_max_ns, 600)
-    prediction_curve = map_asymmetry_prediction(
-        curve_times,
-        g=map_g,
-        a2=map_a2,
-        b_field_t=b_field_t,
-        detector_setup=detector_setup,
-        clip_negative_weights=clip_negative_weights,
-    )
-
-    fig = plt.figure(figsize=(12, 9), constrained_layout=True)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.4], width_ratios=[1.15, 1.0])
-    ax_g = fig.add_subplot(gs[0, 0])
-    ax_asym = fig.add_subplot(gs[0, 1])
-    ax_post = fig.add_subplot(gs[1, 0])
-    ax_a2 = fig.add_subplot(gs[1, 1])
-
-    _plot_1d_marginal_with_hpd(
-        ax_g,
-        grid=g_grid,
-        probability=g_marginal,
-        name="g",
-        true_value=events.true_g,
-        map_value=map_g,
-        show_local_gaussian=show_local_gaussian,
-    )
-
-    valid = chi2_result.valid_bins & np.isfinite(chi2_result.asymmetry) & np.isfinite(chi2_result.asymmetry_error)
-    ax_asym.axhline(0.0, linewidth=0.8)
-    ax_asym.errorbar(
-        chi2_result.bin_centers[valid],
-        chi2_result.asymmetry[valid],
-        yerr=chi2_result.asymmetry_error[valid],
-        marker="o",
-        linestyle="",
-        capsize=3,
-        label="binned data ± Gaussian error",
-    )
-    ax_asym.plot(curve_times, prediction_curve, linewidth=1.8, label="χ² MAP prediction")
-    ax_asym.set_title(f"R(t) fit using {bins} bins")
-    ax_asym.set_xlabel("time [ns]")
-    ax_asym.set_ylabel("R(t)")
-    ax_asym.legend(loc="best", fontsize=8)
-
-    im = ax_post.imshow(
-        post.T,
-        origin="lower",
-        aspect="auto",
-        extent=[g_grid[0], g_grid[-1], a2_grid[0], a2_grid[-1]],
-    )
-    ax_post.plot(events.true_g, events.true_a2, marker="x", markersize=9, label="true")
-    ax_post.plot(map_g, map_a2, marker="+", markersize=10, label="χ² MAP")
-    ax_post.set_title(f"χ² posterior after {n_events} accepted events")
-    ax_post.set_xlabel("g")
-    ax_post.set_ylabel("A₂")
-    ax_post.legend(loc="best", fontsize=8)
-    fig.colorbar(im, ax=ax_post, label="posterior probability")
-
-    _plot_1d_marginal_with_hpd(
-        ax_a2,
-        grid=a2_grid,
-        probability=a2_marginal,
-        name="A₂",
-        true_value=events.true_a2,
-        map_value=map_a2,
-    )
-
-    valid_count = int(np.sum(chi2_result.valid_bins))
-    fig.suptitle(
-        "Binning-dependent analysis:\n "
-        f"MAP g={map_g:.5g}, MAP A₂={map_a2:.5g}, "
-        f"valid bins={valid_count}/{bins}",
-        fontsize=14,
-    )
-    return fig
-
 st.title("Interactive TDPAD toy simulation and analysis")
 st.markdown(
     "This app simulates Time-Dependent Angular Distribution data for a given level of statistics. "
@@ -574,7 +204,7 @@ with st.sidebar:
 
     st.subheader("Flat Prior and Draw ranges")
     g_min, g_max = st.slider("g range", -2.0, 2.0, (0.05, 1.05), step=0.01)
-    a2_min, a2_max = st.slider("A₂ range", -1.0, 1.0, (0.0, 0.3), step=0.01)
+    a2_min, a2_max = st.slider("A₂ range", -0.99, 0.99, (0.0, 0.3), step=0.01)
 
     st.subheader("True parameter choice")
     true_parameter_mode = st.radio(
@@ -584,7 +214,7 @@ with st.sidebar:
     )
     fixed_g = st.number_input("Fixed true g", value=0.2, step=0.01, format="%.6g")
     fixed_a2 = st.number_input(
-        "Fixed true A₂", min_value=-1.0, max_value=1.0, value=0.2, step=0.01, format="%.6g"
+        "Fixed true A₂", min_value=-0.99, max_value=0.99, value=0.2, step=0.01, format="%.6g"
     )
     if true_parameter_mode == "Draw uniformly from ranges":
         st.caption("The fixed-value fields are ignored in draw mode.")
@@ -607,16 +237,6 @@ with st.sidebar:
 
     run_button = st.button("Simulate / rescan", type="primary")
 
-if t_max_ns <= t_min_ns:
-    st.error("t_max must be larger than t_min.")
-    st.stop()
-if g_max <= g_min:
-    st.error("g range must have min < max.")
-    st.stop()
-if a2_max <= a2_min:
-    st.error("A₂ range must have min < max.")
-    st.stop()
-
 if true_parameter_mode == "Set fixed g and A₂":
     if not (g_min <= fixed_g <= g_max):
         st.warning("Fixed true g is outside the likelihood grid range, so the posterior cannot peak at the true g.")
@@ -624,33 +244,29 @@ if true_parameter_mode == "Set fixed g and A₂":
         st.warning("Fixed true A₂ is outside the likelihood grid range, so the posterior cannot peak at the true A₂.")
 
 params = dict(
-    lifetime_ns=float(lifetime_ns),
-    b_field_t=float(b_field_t),
-    phi1_deg=float(phi1_deg),
-    phi2_deg=float(phi2_deg),
-    t_min_ns=float(t_min_ns),
-    t_max_ns=float(t_max_ns),
-    g_min=float(g_min),
-    g_max=float(g_max),
-    a2_min=float(a2_min),
-    a2_max=float(a2_max),
-    true_parameter_mode=str(true_parameter_mode),
-    fixed_g=float(fixed_g),
-    fixed_a2=float(fixed_a2),
-    seed=int(seed),
-    raw_events=int(raw_events),
-    grid_points=int(grid_points),
-    n_frames=int(n_frames),
-    clip_negative_weights=False,
+    lifetime_ns=lifetime_ns,
+    b_field_t=b_field_t,
+    phi1_deg=phi1_deg,
+    phi2_deg=phi2_deg,
+    t_min_ns=t_min_ns,
+    t_max_ns=t_max_ns,
+    g_min=g_min,
+    g_max=g_max,
+    a2_min=a2_min,
+    a2_max=a2_max,
+    true_parameter_mode=true_parameter_mode,
+    fixed_g=fixed_g,
+    fixed_a2=fixed_a2,
+    seed=seed,
+    raw_events=raw_events,
+    grid_points=grid_points,
+    n_frames=n_frames,
 )
 
 if run_button or "last_params" not in st.session_state:
     st.session_state.last_params = params
 else:
     params = st.session_state.last_params
-
-# W is non-negative throughout the selectable A₂ range, so clipping is unnecessary.
-params["clip_negative_weights"] = False
 
 try:
     with st.spinner("Simulating events and scanning likelihood grid..."):
@@ -661,7 +277,7 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
-setup = DetectorSetup(phi1_deg=params["phi1_deg"], phi2_deg=params["phi2_deg"], eff1=1.0, eff2=1.0)
+setup = DetectorSetup(phi1_deg=params["phi1_deg"], phi2_deg=params["phi2_deg"])
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("True g", _format_float(events.true_g, 6))
@@ -682,7 +298,7 @@ st.caption(
 
 if posterior is None:
     st.warning(
-        "No raw exponential events survived the requested time window. Increase t_max, "
+        "No generated events survived the requested time window. Increase t_max, "
         "decrease t_min, increase raw events, or choose a longer lifetime."
     )
     st.stop()
@@ -729,10 +345,9 @@ fig = make_frame_figure(
     b_field_t=params["b_field_t"],
     t_min_ns=params["t_min_ns"],
     t_max_ns=params["t_max_ns"],
-    bins=int(bins),
-    clip_negative_weights=params["clip_negative_weights"],
+    bins=bins,
 )
-fig_svg = _figure_as_svg(fig)
+fig_svg = figure_as_svg(fig)
 top_figure_slot.pyplot(fig, clear_figure=True)
 plt.close(fig)
 st.download_button(
@@ -754,8 +369,7 @@ with st.spinner("Computing binned χ² posterior for the selected snapshot..."):
         posterior.a2_grid,
         params["t_min_ns"],
         params["t_max_ns"],
-        int(bins),
-        params["clip_negative_weights"],
+        bins,
     )
 
 valid_chi2_bins = int(np.sum(chi2_result.valid_bins))
@@ -778,11 +392,10 @@ fig_chi2 = make_chi2_frame_figure(
     b_field_t=params["b_field_t"],
     t_min_ns=params["t_min_ns"],
     t_max_ns=params["t_max_ns"],
-    bins=int(bins),
-    clip_negative_weights=params["clip_negative_weights"],
+    bins=bins,
     show_local_gaussian=show_local_gaussian,
 )
-fig_chi2_svg = _figure_as_svg(fig_chi2)
+fig_chi2_svg = figure_as_svg(fig_chi2)
 st.pyplot(fig_chi2, clear_figure=True)
 plt.close(fig_chi2)
 st.download_button(
@@ -793,59 +406,5 @@ st.download_button(
 )
 
 with st.expander("Implementation notes"):
-    st.markdown(
-        "**Data generation**\n"
-        "- Single events are of the form `(i, t)` where `i` is the detector index (either 0 or 1) and `t` is the time in ns.\n"
-        "- The event generation uses the standard TDPAD angular distribution formula:"
-    )
-    st.latex(
-        r"""
-        \begin{aligned}
-        p(i,t) &\propto \epsilon(i)\,\exp(-\lambda t)\,
-        W\!\left(\theta(i),t\right) \\[0.4em]
-        W(\theta,t) &= 1 + A_2\left[
-        \frac{1}{4} + \frac{3}{4}
-        \cos\!\left(2\theta - 2 g \mu_N \frac{B}{\hbar} t\right)
-        \right].
-        \end{aligned}
-        """
-    )
-    st.markdown(
-        "- True `g` and `A₂` can either be drawn uniformly from the displayed ranges or fixed manually.\n"
-        "- Only events inside the observration window`[t_min, t_max]` are retained, so the accepted sample can "
-        "contain fewer than the raw number of generated events.\n"
-        "- Detector efficiencies are hard-coded to 1 for both detectors.\n"
-        " \n**Data analysis**\n"
-        "- The prior over the displayed `g × A₂` range is flat.\n"
-        "- The binning-independent likelihood is given by:"
-    )
-    st.latex(
-        r"""
-        \begin{aligned}
-        p(i_k|t_k)=\frac{  W\left(\theta(i_k),t_k\right)}
-        {\sum_{j=0}^{I-1}   W\left(\theta(j),t_k\right)},\\[0.4em]
-        \mathcal L(g,A_2|\mathcal D) = \prod_{k=0}^{K-1} p(i_k|t_k)        
-        \end{aligned}
-        """
-    )
-    st.markdown(
-        "- The binning-dependent likelihood is given by:"
-    )
-    st.latex(
-        r"""
-        \begin{aligned}
-        R(t)=\frac{p(0,t)-p(1,t)}{p(0,t)+p(1,t)},\\[0.4em]
-        \mathcal L(g,A_2|\mathcal D) \propto \exp\left(-\frac{1}{2}\sum_{\tilde k}\frac{(R^{exp}_{\tilde k}-R^{theo}(t_{\tilde k}))^2}{(\Delta R_{\tilde k}^{exp})^2}\right)
-        \end{aligned}
-        """
-    )
-    st.markdown(     
-        "- Bins with zero counts in either detector are excluded from the binnning dependent analysis. The number of bins can be adjusted with a slider.\n" 
-        "- The posterior is computed on a uniform grid in `g × A₂` space, and the MAP is found by locating the grid point with the maximum posterior probability. The number of grid points can be adjusted.\n"
-        "- The posterior snapshots are cumulative: The analysis uses all accepted events up to the selected snapshot.\n"
-        "\n**Interpretation**\n"
-        "- In the marginalized 1D posteriors, the 68% and 95% highest-posterior-density (HPD) regions are shaded in light green. The MAP is marked with a red cross, and the true value is marked with a dashed line.\n"
-        "- Note the different character of the top-right figure. For the binning-independent analysis, it serves only as a visualization and a different binning has no influcence on the posterior."
-        "For the binning-dependent analysis, the top-right figure is used to compute the likelihood and a different bin size will result in a different posterior.\n"
-        "- A local Gaussian can be fit to the g marginal posterior to visualize a classical uncertainty estimate.\n"
-    )
+    notes_path = Path(__file__).with_name("implementation_notes.md")
+    st.markdown(notes_path.read_text(encoding="utf-8"))
