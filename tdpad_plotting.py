@@ -16,7 +16,8 @@ HPD_COLOR = "lightgreen"
 
 def figure_as_svg(fig: plt.Figure) -> bytes:
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="svg", bbox_inches="tight")
+    with plt.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(buffer, format="svg", bbox_inches="tight")
     return buffer.getvalue()
 
 

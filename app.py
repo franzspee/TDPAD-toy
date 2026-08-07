@@ -317,6 +317,9 @@ st.write(
 )
 
 top_figure_slot = st.empty()
+previous_event_figure_svg = st.session_state.get("event_figure_svg")
+if previous_event_figure_svg is not None:
+    top_figure_slot.image(previous_event_figure_svg, width="stretch")
 
 st.divider()
 bins = st.slider(
@@ -348,7 +351,9 @@ fig = make_frame_figure(
     bins=bins,
 )
 fig_svg = figure_as_svg(fig)
-top_figure_slot.pyplot(fig, clear_figure=True)
+fig_svg_text = fig_svg.decode("utf-8")
+top_figure_slot.image(fig_svg_text, width="stretch")
+st.session_state["event_figure_svg"] = fig_svg_text
 plt.close(fig)
 st.download_button(
     "Download binning-independent figure as SVG",
@@ -396,7 +401,7 @@ fig_chi2 = make_chi2_frame_figure(
     show_local_gaussian=show_local_gaussian,
 )
 fig_chi2_svg = figure_as_svg(fig_chi2)
-st.pyplot(fig_chi2, clear_figure=True)
+st.image(fig_chi2_svg.decode("utf-8"), width="stretch")
 plt.close(fig_chi2)
 st.download_button(
     "Download binning-dependent figure as SVG",
